@@ -78,6 +78,8 @@ final class BoardView: NSView {
     private var lineHistory: [(origin: CGPoint, lineStart: Int)] = []
     /// Point picked in precision mode; the next touch lands exactly here.
     private var anchor: CGPoint?
+    /// The anchor was only previewed by pressing Control and has not been moved yet.
+    private var anchorIsPreview = false
 
     private var padRect: CGRect {
         CGRect(x: padOrigin.x, y: padOrigin.y, width: padWidth, height: padWidth / padAspect)
@@ -194,7 +196,7 @@ final class BoardView: NSView {
                 mode = .pan
             } else if controlDown {
                 mode = .aim
-                anchor = worldPoint(norm)
+                if anchor == nil { anchor = defaultAnchor() }
             } else if spaceDown {
                 mode = .hover
                 hoverPoint = worldPoint(norm)
@@ -207,6 +209,39 @@ final class BoardView: NSView {
         }
     }
 
+    /// Where the crosshair starts: the end of the last stroke (like a text caret),
+    /// or the middle of the zone on an empty board.
+    private func defaultAnchor() -> CGPoint {
+        strokes.last?.points.last ?? CGPoint(x: padRect.midX, y: padRect.midY)
+    }
+
+    /// Pressing Control shows the crosshair straight away; releasing it without
+    /// moving the crosshair removes it again so nothing changes by accident.
+    override func flagsChanged(with event: NSEvent) {
+        guard captured else { return }
+        if event.modifierFlags.contains(.control) {
+            if anchor == nil {
+                anchor = defaultAnchor()
+                anchorIsPreview = true
+                followPoint(anchor!)
+            }
+        } else if anchorIsPreview {
+            anchor = nil
+            anchorIsPreview = false
+            followPad()
+        }
+        needsDisplay = true
+    }
+
+    /// Scrolls the board the minimum amount needed to keep a point on screen.
+    private func followPoint(_ p: CGPoint) {
+        camera.x = min(camera.x, p.x - cameraMargin)
+        camera.x = max(camera.x, p.x + cameraMargin - bounds.width)
+        camera.y = min(camera.y, p.y - cameraMargin)
+        camera.y = max(camera.y, p.y + cameraMargin - bounds.height)
+        needsDisplay = true
+    }
+
     /// Moves the zone before a stroke starts: onto the precision anchor if one is set,
     /// otherwise further along the line when the previous ink reached the right end.
     private func repositionForTouch(at norm: CGPoint) {
@@ -214,6 +249,7 @@ final class BoardView: NSView {
         if let a = anchor {
             padOrigin = CGPoint(x: a.x - norm.x * r.width, y: a.y - (1 - norm.y) * r.height)
             anchor = nil
+            anchorIsPreview = false
             followPad()
             return
         }
@@ -258,9 +294,14 @@ final class BoardView: NSView {
             }
             needsDisplay = true
         case .aim:
-            if controlDown {
-                anchor = worldPoint(norm)
-                needsDisplay = true
+            if controlDown, let a = anchor {
+                // Relative, like a normal trackpad: lift and re-touch to keep going further.
+                let size = padRect.size
+                let moved = CGPoint(x: a.x + (norm.x - lastNorm.x) * size.width,
+                                    y: a.y - (norm.y - lastNorm.y) * size.height)
+                anchor = moved
+                anchorIsPreview = false
+                followPoint(moved)
             } else {
                 // The anchor stays where it was; wait for a fresh touch to write.
                 mode = .ignore
@@ -272,7 +313,7 @@ final class BoardView: NSView {
             } else if controlDown {
                 commitCurrent()
                 mode = .aim
-                anchor = worldPoint(norm)
+                if anchor == nil { anchor = defaultAnchor() }
                 needsDisplay = true
             } else if spaceDown {
                 commitCurrent()
@@ -486,7 +527,7 @@ final class BoardView: NSView {
 
     private func drawHint() {
         let text = captured
-            ? "Trackpad captured  ·  ⌘ + finger: move zone  ·  ⌃ + finger: aim next stroke  ·  space + finger: hover  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
+            ? "Trackpad captured  ·  ⌘ + finger: move zone  ·  ⌃ + finger: move next-stroke target  ·  space + finger: hover  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
             : "Click or press esc to capture the trackpad"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
