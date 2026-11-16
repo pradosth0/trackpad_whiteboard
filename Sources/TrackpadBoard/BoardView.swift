@@ -88,8 +88,8 @@ final class BoardView: NSView {
     // MARK: Touch state
 
     private enum Mode { case idle, draw, pan, aim, hover, ignore }
-    /// Space is held: the finger shows a pointer instead of inking.
-    private var spaceDown = false
+    /// Either Shift key is held: the finger shows a pointer instead of inking.
+    private var hoverKeyDown: Bool { NSEvent.modifierFlags.contains(.shift) }
     private var hoverPoint: CGPoint?
     private var mode: Mode = .idle
     private var trackedID: NSObjectProtocol?
@@ -127,7 +127,6 @@ final class BoardView: NSView {
             NSCursor.hide()
         } else {
             finishTouch()
-            spaceDown = false
             CGAssociateMouseAndMouseCursorPosition(1)
             NSCursor.unhide()
         }
@@ -197,7 +196,7 @@ final class BoardView: NSView {
             } else if controlDown {
                 mode = .aim
                 if anchor == nil { anchor = defaultAnchor() }
-            } else if spaceDown {
+            } else if hoverKeyDown {
                 mode = .hover
                 hoverPoint = worldPoint(norm)
             } else {
@@ -284,10 +283,10 @@ final class BoardView: NSView {
         let norm = touch.normalizedPosition
         switch mode {
         case .hover:
-            if spaceDown {
+            if hoverKeyDown {
                 hoverPoint = worldPoint(norm)
             } else {
-                // Releasing Space with the finger still down starts inking from the pointer.
+                // Releasing Shift with the finger still down starts inking from the pointer.
                 hoverPoint = nil
                 mode = .draw
                 current = Stroke(start: worldPoint(norm))
@@ -315,7 +314,7 @@ final class BoardView: NSView {
                 mode = .aim
                 if anchor == nil { anchor = defaultAnchor() }
                 needsDisplay = true
-            } else if spaceDown {
+            } else if hoverKeyDown {
                 commitCurrent()
                 mode = .hover
                 hoverPoint = worldPoint(norm)
@@ -353,9 +352,6 @@ final class BoardView: NSView {
         }
     }
 
-    override func keyUp(with event: NSEvent) {
-        if event.keyCode == 49 { spaceDown = false } else { super.keyUp(with: event) }
-    }
 
     private func commitCurrent() {
         guard let stroke = current else { return }
@@ -413,8 +409,6 @@ final class BoardView: NSView {
             }
             anchor = nil
             followPad()
-        case 49: // Space: hover while held
-            spaceDown = captured
         case 53: // Escape
             setCapture(!captured)
         default:
@@ -527,7 +521,7 @@ final class BoardView: NSView {
 
     private func drawHint() {
         let text = captured
-            ? "Trackpad captured  ·  ⌘ + finger: move zone  ·  ⌃ + finger: move next-stroke target  ·  space + finger: hover  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
+            ? "Trackpad captured  ·  ⌘ + finger: move zone  ·  ⌃ + finger: move next-stroke target  ·  ⇧ + finger: hover  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
             : "Click or press esc to capture the trackpad"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
