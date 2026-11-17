@@ -300,6 +300,9 @@ final class BoardView: NSView, NSTextFieldDelegate {
                 hoverPoint = worldPoint(norm)
                 hoverStart = (Date(), norm)
                 hoverTravel = 0
+            } else if edit != nil {
+                // A block is open in the field: the finger does not ink until it is closed.
+                mode = .ignore
             } else {
                 mode = .draw
                 repositionForTouch(at: norm)
@@ -394,10 +397,15 @@ final class BoardView: NSView, NSTextFieldDelegate {
                     hoverTravel = max(hoverTravel, hypot(norm.x - start.norm.x, norm.y - start.norm.y))
                 }
             } else {
-                // Releasing Shift with the finger still down starts inking from the pointer.
+                // Releasing Shift with the finger still down starts inking from the pointer,
+                // unless a block is open.
                 hoverPoint = nil
-                mode = .draw
-                current = Stroke(start: worldPoint(norm))
+                if edit != nil {
+                    mode = .ignore
+                } else {
+                    mode = .draw
+                    current = Stroke(start: worldPoint(norm))
+                }
             }
             needsDisplay = true
         case .aim:
@@ -1025,7 +1033,7 @@ final class BoardView: NSView, NSTextFieldDelegate {
 
     private func drawHint() {
         let text = edit != nil
-            ? "Typing  ·  math goes between $…$  ·  ↩ keep  ·  esc cancel  ·  ⌘ + finger: move this block  ·  ⌘⌫ delete it"
+            ? "Typing (drawing is paused)  ·  math goes between $…$  ·  ↩ keep  ·  esc cancel  ·  ⌘ + finger: move this block  ·  ⌘⌫ delete it"
             : captured
             ? "⌘ + finger: move zone  ·  ⌃ + finger: move target  ·  ⇧ + finger: hover  ·  ⇧ or ⌃ + click on a block: edit, ⌫: delete  ·  type: add text  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
             : "Click or press esc to capture the trackpad"
