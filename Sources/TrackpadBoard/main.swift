@@ -21,7 +21,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         NSApp.mainMenu = makeMenu()
         window.makeKeyAndOrderFront(nil)
+        board.warmUpRecognition()
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        ClaudeCodeSession.shared.stop()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -61,11 +66,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         boardMenu.addItem(.separator())
         add("Auto-continue Lines", #selector(BoardView.toggleAutoContinue(_:)), "a", [.command, .shift])
         boardMenu.items.last?.state = board.autoContinue ? .on : .off
+        boardMenu.addItem(.separator())
+        add("Recognize Lines on Enter", #selector(BoardView.toggleRecognize(_:)), "r", [.command, .shift])
+        boardMenu.items.last?.state = board.recognizeOnEnter ? .on : .off
+        add("Use Most Accurate Model", #selector(BoardView.toggleAccurateModel(_:)), "m", [.command, .shift])
+        boardMenu.items.last?.state = board.useAccurateModel ? .on : .off
+        add("Use Claude Code Subscription", #selector(BoardView.toggleClaudeCode(_:)), "k", [.command, .shift])
+        boardMenu.items.last?.state = board.useClaudeCode ? .on : .off
         boardItem.submenu = boardMenu
         main.addItem(boardItem)
 
         return main
     }
+}
+
+// Developer checks that need no trackpad:
+//   --render-test <latex> <out.png>   typeset LaTeX to a picture
+//   --ocr-test <line.png>...          send pictures through recognition and print the LaTeX
+//                                     (add --claude-code for the subscription route, --accurate for Opus)
+let arguments = CommandLine.arguments
+if let i = arguments.firstIndex(of: "--render-test"), arguments.count > i + 2 {
+    guard let item = Typeset(latex: arguments[i + 1], replacing: CGRect(x: 0, y: 0, width: 400, height: 60),
+                             color: .black),
+          let tiff = item.image.tiffRepresentation,
+          let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+        print("render failed"); exit(1)
+    }
+    try! png.write(to: URL(fileURLWithPath: arguments[i + 2]))
+    print("font size \(item.fontSize), size \(item.image.size)")
+    exit(0)
+}
+if let i = arguments.firstIndex(of: "--ocr-test"), arguments.count > i + 1 {
+    let files = arguments[(i + 1)...].filter { !$0.hasPrefix("--") }
+    let model: Recognizer.Model = arguments.contains("--accurate") ? .accurate : .fast
+    let viaClaudeCode = arguments.contains("--claude-code")
+    let key = Recognizer.apiKey()
+    if !viaClaudeCode, key == nil { print("no API key"); exit(1) }
+    var remaining = files.count
+    // All sent at once, as when lines are written faster than they are answered.
+    for file in files {
+        let png = try! Data(contentsOf: URL(fileURLWithPath: file))
+        let started = Date()
+        let done: (Result<String, Recognizer.Failure>) -> Void = { result in
+            print(String(format: "%@  %.1fs ", (file as NSString).lastPathComponent,
+                         Date().timeIntervalSince(started)), result)
+            remaining -= 1
+            if remaining == 0 { ClaudeCodeSession.shared.stop(); exit(0) }
+        }
+        if viaClaudeCode {
+            ClaudeCodeSession.shared.recognize(png: png, model: model, completion: done)
+        } else {
+            Recognizer.recognize(png: png, model: model, key: key!, completion: done)
+        }
+    }
+    RunLoop.main.run()
 }
 
 let app = NSApplication.shared

@@ -2,11 +2,17 @@ import AppKit
 
 /// One continuous finger contact, in board (world) coordinates.
 struct Stroke {
+    private static var nextID = 0
+
+    /// Stable identity: indices shift when recognized lines are replaced.
+    let id: Int
     var points: [CGPoint]
     private(set) var path: CGPath
     private(set) var bounds: CGRect
 
     init(start: CGPoint) {
+        Stroke.nextID += 1
+        id = Stroke.nextID
         points = [start]
         path = Stroke.makePath([start])
         bounds = path.boundingBoxOfPath
@@ -60,8 +66,40 @@ final class BoardView: NSView {
 
     private var strokes: [Stroke] = []
     private var current: Stroke?
-    private enum UndoItem { case stroke, clear([Stroke]) }
+    /// Recognized lines, typeset in place of their handwriting.
+    private var typeset: [Typeset] = []
+    private enum UndoItem {
+        case stroke
+        case clear([Stroke], [Typeset])
+        /// A line was replaced by typeset math; undo puts the handwriting back.
+        case recognized(ink: [(index: Int, stroke: Stroke)], typesetID: Int)
+    }
     private var undoStack: [UndoItem] = []
+
+    // MARK: Recognition state
+
+    /// When on, Enter sends the finished line to be recognized and typeset.
+    private(set) var recognizeOnEnter = UserDefaults.standard.object(forKey: "recognizeOnEnter") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(recognizeOnEnter, forKey: "recognizeOnEnter") }
+    }
+    /// Slower and about twice the price, but misreads fewer symbols.
+    private(set) var useAccurateModel = UserDefaults.standard.bool(forKey: "useAccurateModel") {
+        didSet { UserDefaults.standard.set(useAccurateModel, forKey: "useAccurateModel") }
+    }
+    /// Recognize through the Claude Code tool (Claude subscription) instead of an API key.
+    /// Defaults to on when no API key is set up.
+    private(set) var useClaudeCode = UserDefaults.standard.object(forKey: "useClaudeCode") as? Bool
+        ?? (Recognizer.apiKey() == nil) {
+        didSet { UserDefaults.standard.set(useClaudeCode, forKey: "useClaudeCode") }
+    }
+    private var model: Recognizer.Model { useAccurateModel ? .accurate : .fast }
+    /// Strokes of lines that were sent and not answered yet.
+    private var pendingStrokes: Set<Int> = []
+    private var pendingLines = 0
+    /// Short message under the board (errors, missing key).
+    private var notice: String?
+    private var noticeToken = 0
+    private var warnedAboutSetup = false
 
     /// Top-left of the trackpad zone on the board.
     private var padOrigin = CGPoint.zero
@@ -403,6 +441,7 @@ final class BoardView: NSView {
                 }
             } else {
                 lineHistory.append((padOrigin, lineStart))
+                recognizeCurrentLine()
                 padOrigin.y += newLineStep()
                 padOrigin.x = marginX
                 lineStart = strokes.count
@@ -419,8 +458,18 @@ final class BoardView: NSView {
     @objc func undoStroke(_ sender: Any?) {
         guard let item = undoStack.popLast() else { return }
         switch item {
-        case .stroke: if !strokes.isEmpty { strokes.removeLast() }
-        case .clear(let old): strokes = old
+        case .stroke:
+            if let last = strokes.popLast() { pendingStrokes.remove(last.id) }
+        case .clear(let oldStrokes, let oldTypeset):
+            strokes = oldStrokes
+            typeset = oldTypeset
+        case .recognized(let ink, let typesetID):
+            typeset.removeAll { $0.id == typesetID }
+            for (index, stroke) in ink {
+                let at = min(index, strokes.count)
+                strokes.insert(stroke, at: at)
+                shiftLineStarts(from: at, by: 1)
+            }
         }
         lineStart = min(lineStart, strokes.count)
         needsDisplay = true
@@ -432,11 +481,158 @@ final class BoardView: NSView {
     }
 
     @objc func clearBoard(_ sender: Any?) {
-        guard !strokes.isEmpty else { return }
-        undoStack.append(.clear(strokes))
+        guard !strokes.isEmpty || !typeset.isEmpty else { return }
+        undoStack.append(.clear(strokes, typeset))
         strokes = []
+        typeset = []
+        pendingStrokes = []
         lineStart = 0
         needsDisplay = true
+    }
+
+    @objc func toggleRecognize(_ sender: Any?) {
+        recognizeOnEnter.toggle()
+        (sender as? NSMenuItem)?.state = recognizeOnEnter ? .on : .off
+    }
+
+    @objc func toggleAccurateModel(_ sender: Any?) {
+        useAccurateModel.toggle()
+        (sender as? NSMenuItem)?.state = useAccurateModel ? .on : .off
+        warmUpRecognition()
+    }
+
+    @objc func toggleClaudeCode(_ sender: Any?) {
+        useClaudeCode.toggle()
+        (sender as? NSMenuItem)?.state = useClaudeCode ? .on : .off
+        warnedAboutSetup = false
+        if useClaudeCode { warmUpRecognition() } else { ClaudeCodeSession.shared.stop() }
+    }
+
+    /// Starts the Claude Code process early so the first line is not slower than the rest.
+    func warmUpRecognition() {
+        if recognizeOnEnter, useClaudeCode { ClaudeCodeSession.shared.warmUp(model: model) }
+    }
+
+    // MARK: Recognition
+
+    /// Sends the ink written since the last Enter; the answer replaces it whenever it arrives.
+    private func recognizeCurrentLine() {
+        guard recognizeOnEnter else { return }
+        let line = strokes[min(lineStart, strokes.count)...].filter { !pendingStrokes.contains($0.id) }
+        guard !line.isEmpty else { return }
+        let key = useClaudeCode ? nil : Recognizer.apiKey()
+        let problem: String? = useClaudeCode
+            ? (ClaudeCodeSession.executable() == nil ? "the claude command was not found. Install Claude Code or switch to an API key in the Board menu." : nil)
+            : (key == nil ? "no API key. Put one in ~/.config/trackpad-board/api_key, or switch to Claude Code in the Board menu." : nil)
+        if let problem {
+            if !warnedAboutSetup {
+                warnedAboutSetup = true
+                show(notice: "Recognition is off: \(problem)", seconds: 12)
+            }
+            return
+        }
+        guard let png = BoardView.renderPNG(of: line, strokeWidth: strokeWidth) else { return }
+        let ids = Set(line.map { $0.id })
+        pendingStrokes.formUnion(ids)
+        pendingLines += 1
+        needsDisplay = true
+        let done: (Result<String, Recognizer.Failure>) -> Void = { [weak self] result in
+            self?.finishRecognition(of: ids, result: result)
+        }
+        if let key {
+            Recognizer.recognize(png: png, model: model, key: key, completion: done)
+        } else {
+            ClaudeCodeSession.shared.recognize(png: png, model: model, completion: done)
+        }
+    }
+
+    private func finishRecognition(of ids: Set<Int>, result: Result<String, Recognizer.Failure>) {
+        pendingLines -= 1
+        pendingStrokes.subtract(ids)
+        needsDisplay = true
+        // The line was edited, undone or cleared while waiting: keep what is on the board.
+        let ink = strokes.enumerated().filter { ids.contains($0.element.id) }
+        guard ink.count == ids.count else { return }
+        switch result {
+        case .failure(let failure):
+            show(notice: "Recognition failed: \(failure.message)", seconds: 8)
+        case .success(let latex):
+            let area = ink.map { $0.element.bounds }.reduce(CGRect.null) { $0.union($1) }
+            guard let item = Typeset(latex: latex, replacing: area, color: inkColor) else {
+                show(notice: "Could not typeset the answer: \(latex)", seconds: 8)
+                return
+            }
+            for (index, _) in ink.reversed() {
+                strokes.remove(at: index)
+                shiftLineStarts(from: index + 1, by: -1)
+            }
+            typeset.append(item)
+            undoStack.append(.recognized(ink: ink.map { (index: $0.offset, stroke: $0.element) },
+                                         typesetID: item.id))
+        }
+    }
+
+    /// Keeps the line bookkeeping pointing at the same strokes after an insert or removal.
+    private func shiftLineStarts(from index: Int, by delta: Int) {
+        if lineStart >= index { lineStart = max(0, lineStart + delta) }
+        for i in lineHistory.indices where lineHistory[i].lineStart >= index {
+            lineHistory[i].lineStart = max(0, lineHistory[i].lineStart + delta)
+        }
+    }
+
+    private func show(notice text: String, seconds: Double) {
+        notice = text
+        noticeToken += 1
+        let token = noticeToken
+        needsDisplay = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self, self.noticeToken == token else { return }
+            self.notice = nil
+            self.needsDisplay = true
+        }
+    }
+
+    /// The ink colour resolved for the current light / dark appearance.
+    private var inkColor: NSColor {
+        var color = NSColor.black
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            color = NSColor.labelColor.usingColorSpace(.sRGB) ?? .black
+        }
+        return color
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        let color = inkColor
+        for i in typeset.indices { typeset[i].recolor(color) }
+        needsDisplay = true
+    }
+
+    /// Black ink on white, cropped to the strokes and enlarged so small writing stays legible.
+    static func renderPNG(of line: [Stroke], strokeWidth: CGFloat) -> Data? {
+        let ink = line.map { $0.bounds }.reduce(CGRect.null) { $0.union($1) }
+        guard !ink.isNull else { return nil }
+        let area = ink.insetBy(dx: -24, dy: -24)
+        var scale = min(max(260 / area.height, 1.5), 4)
+        scale = min(scale, 1568 / area.width, 1568 / area.height)
+        let width = Int((area.width * scale).rounded(.up)), height = Int((area.height * scale).rounded(.up))
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        // Board coordinates grow downward, bitmap coordinates upward.
+        ctx.translateBy(x: 0, y: CGFloat(height))
+        ctx.scaleBy(x: scale, y: -scale)
+        ctx.translateBy(x: -area.minX, y: -area.minY)
+        ctx.setStrokeColor(CGColor(gray: 0, alpha: 1))
+        ctx.setLineWidth(strokeWidth)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        for stroke in line { ctx.addPath(stroke.path) }
+        ctx.strokePath()
+        guard let image = ctx.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
     }
 
     @objc func setMarginHere(_ sender: Any?) {
@@ -475,11 +671,25 @@ final class BoardView: NSView {
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
         let visible = CGRect(origin: camera, size: bounds.size).insetBy(dx: -strokeWidth, dy: -strokeWidth)
-        for stroke in strokes where stroke.path.boundingBoxOfPath.insetBy(dx: -2, dy: -2).intersects(visible) {
+        for stroke in strokes where !pendingStrokes.contains(stroke.id)
+            && stroke.bounds.insetBy(dx: -2, dy: -2).intersects(visible) {
             ctx.addPath(stroke.path)
         }
         if let current { ctx.addPath(current.path) }
         ctx.strokePath()
+
+        // Lines waiting for their recognition result are dimmed.
+        if !pendingStrokes.isEmpty {
+            ctx.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.45).cgColor)
+            for stroke in strokes where pendingStrokes.contains(stroke.id) { ctx.addPath(stroke.path) }
+            ctx.strokePath()
+        }
+
+        // Recognized lines.
+        for item in typeset where item.bounds.intersects(visible) {
+            item.image.draw(in: item.bounds, from: .zero, operation: .sourceOver, fraction: 1,
+                            respectFlipped: true, hints: nil)
+        }
 
         // Trackpad zone outline.
         let accent = captured ? NSColor.controlAccentColor : NSColor.secondaryLabelColor
@@ -530,5 +740,13 @@ final class BoardView: NSView {
         let size = text.size(withAttributes: attrs)
         text.draw(at: CGPoint(x: (bounds.width - size.width) / 2, y: bounds.height - size.height - 8),
                   withAttributes: attrs)
+
+        let status = notice ?? (pendingLines > 0 ? "Recognizing \(pendingLines) line\(pendingLines == 1 ? "" : "s")…" : nil)
+        if let status {
+            let statusSize = status.size(withAttributes: attrs)
+            status.draw(at: CGPoint(x: (bounds.width - statusSize.width) / 2,
+                                    y: bounds.height - size.height - statusSize.height - 14),
+                        withAttributes: attrs)
+        }
     }
 }

@@ -8,6 +8,8 @@ APP="TrackpadBoard.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp .build/release/TrackpadBoard "$APP/Contents/MacOS/TrackpadBoard"
+# Math fonts of the LaTeX renderer; SwiftPM looks for resource bundles at the app's top level.
+cp -R .build/release/*.bundle "$APP/"
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
