@@ -75,6 +75,17 @@ struct Typeset {
         placement = placement.moved(dx: dx, dy: dy)
     }
 
+    /// Restores a saved block from both of its forms.
+    init?(source: String, latex: String, fontSize: CGFloat, placement: Placement, color: NSColor) {
+        guard let image = MathRenderer.image(latex: latex, fontSize: fontSize, color: color) else { return nil }
+        id = Typeset.newID()
+        self.source = source
+        self.latex = latex
+        self.fontSize = fontSize
+        self.placement = placement
+        self.image = image
+    }
+
     /// Re-renders in a new ink colour (light / dark mode switch).
     mutating func recolor(_ color: NSColor) {
         if let fresh = MathRenderer.image(latex: latex, fontSize: fontSize, color: color) { image = fresh }

@@ -22,6 +22,21 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleShortVersionString</key><string>0.1</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleDocumentTypes</key>
+    <array><dict>
+        <key>CFBundleTypeName</key><string>Trackpad Board</string>
+        <key>CFBundleTypeRole</key><string>Editor</string>
+        <key>LSHandlerRank</key><string>Owner</string>
+        <key>LSItemContentTypes</key><array><string>local.trackpad-board.board</string></array>
+    </dict></array>
+    <key>UTExportedTypeDeclarations</key>
+    <array><dict>
+        <key>UTTypeIdentifier</key><string>local.trackpad-board.board</string>
+        <key>UTTypeDescription</key><string>Trackpad Board</string>
+        <key>UTTypeConformsTo</key><array><string>public.json</string></array>
+        <key>UTTypeTagSpecification</key>
+        <dict><key>public.filename-extension</key><array><string>tboard</string></array></dict>
+    </dict></array>
 </dict>
 </plist>
 EOF

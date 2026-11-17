@@ -18,6 +18,16 @@ struct Stroke {
         bounds = path.boundingBoxOfPath
     }
 
+    /// A stroke read back from a file.
+    init?(points: [CGPoint]) {
+        guard !points.isEmpty else { return nil }
+        Stroke.nextID += 1
+        id = Stroke.nextID
+        self.points = points
+        path = Stroke.makePath(points)
+        bounds = path.boundingBoxOfPath
+    }
+
     mutating func append(_ p: CGPoint) {
         points.append(p)
         path = Stroke.makePath(points)
@@ -64,10 +74,192 @@ final class BoardView: NSView, NSTextFieldDelegate {
 
     // MARK: Board state (world coordinates, y grows downward)
 
-    private var strokes: [Stroke] = []
+    private var strokes: [Stroke] = [] { didSet { contentChanged() } }
     private var current: Stroke?
     /// Recognized lines, typeset in place of their handwriting.
-    private var typeset: [Typeset] = []
+    private var typeset: [Typeset] = [] { didSet { contentChanged() } }
+
+    // MARK: Saving
+
+    /// The board differs from what was last saved or opened.
+    private(set) var isDirty = false
+    var onDirtyChange: (() -> Void)?
+    /// Called on every change to the ink or the blocks.
+    var onChange: (() -> Void)?
+    private var trackChanges = true
+
+    private func contentChanged() {
+        guard trackChanges else { return }
+        onChange?()
+        markDirty()
+    }
+
+    func markDirty() {
+        guard !isDirty else { return }
+        isDirty = true
+        onDirtyChange?()
+    }
+
+    func markClean() {
+        isDirty = false
+        onDirtyChange?()
+    }
+
+    /// Everything a file needs to reopen the board as it is now.
+    func snapshot() -> BoardFile {
+        func point(_ p: CGPoint) -> BoardFile.Point {
+            // Hundredths of a point are far below anything visible and keep files small.
+            BoardFile.Point(x: (Double(p.x) * 100).rounded() / 100, y: (Double(p.y) * 100).rounded() / 100)
+        }
+        var file = BoardFile()
+        file.strokes = strokes.map { stroke in
+            stroke.points.flatMap { p -> [Double] in
+                let q = point(p)
+                return [q.x, q.y]
+            }
+        }
+        file.blocks = typeset.map { block in
+            let (anchor, position): (String, CGPoint)
+            switch block.placement {
+            case .leftCentre(let p): (anchor, position) = ("leftCentre", p)
+            case .topLeft(let p): (anchor, position) = ("topLeft", p)
+            }
+            return BoardFile.Block(source: block.source, latex: block.latex, fontSize: Double(block.fontSize),
+                                   anchor: anchor, position: point(position))
+        }
+        file.zoneOrigin = point(padOrigin)
+        file.zoneWidth = Double(padWidth)
+        file.zoneAspect = Double(padAspect)
+        file.marginX = Double(marginX)
+        file.camera = point(camera)
+        file.lineFirstStroke = lineStart
+        file.lineBlocks = lineBlockIDs.compactMap { id in typeset.firstIndex { $0.id == id } }
+        file.previousLines = lineHistory.map { BoardFile.Line(zoneOrigin: point($0.origin), firstStroke: $0.lineStart) }
+        return file
+    }
+
+    /// Replaces the whole board with a saved one. Returns how many blocks could not be typeset.
+    @discardableResult
+    func load(_ file: BoardFile) -> Int {
+        if edit != nil { cancelEdit() }
+        finishTouch()
+        trackChanges = false
+        defer { trackChanges = true }
+
+        strokes = file.strokes.compactMap { flat in
+            Stroke(points: stride(from: 0, to: flat.count - 1, by: 2).map { CGPoint(x: flat[$0], y: flat[$0 + 1]) })
+        }
+        let color = inkColor
+        var failed = 0
+        var blockIDs: [Int?] = []
+        typeset = []
+        for saved in file.blocks {
+            let position = CGPoint(x: saved.position.x, y: saved.position.y)
+            let placement: Typeset.Placement = saved.anchor == "topLeft" ? .topLeft(position) : .leftCentre(position)
+            if let block = Typeset(source: saved.source, latex: saved.latex, fontSize: CGFloat(saved.fontSize),
+                                   placement: placement, color: color) {
+                typeset.append(block)
+                blockIDs.append(block.id)
+            } else {
+                failed += 1
+                blockIDs.append(nil)
+            }
+        }
+        padOrigin = CGPoint(x: file.zoneOrigin.x, y: file.zoneOrigin.y)
+        padWidth = min(max(CGFloat(file.zoneWidth), 150), 3000)
+        if file.zoneAspect > 0.2, file.zoneAspect < 10 { padAspect = CGFloat(file.zoneAspect) }
+        marginX = CGFloat(file.marginX)
+        camera = CGPoint(x: file.camera.x, y: file.camera.y)
+        lineStart = min(max(file.lineFirstStroke, 0), strokes.count)
+        lineBlockIDs = file.lineBlocks.compactMap { $0 >= 0 && $0 < blockIDs.count ? blockIDs[$0] : nil }
+        lineHistory = file.previousLines.map {
+            (CGPoint(x: $0.zoneOrigin.x, y: $0.zoneOrigin.y), min(max($0.firstStroke, 0), strokes.count))
+        }
+        undoStack = []
+        pendingStrokes = []
+        anchor = nil
+        anchorIsPreview = false
+        isDirty = false
+        onDirtyChange?()
+        followPad()
+        return failed
+    }
+
+    // MARK: Export
+
+    /// The area covered by ink and blocks, with a margin; nil for an empty board.
+    private var exportArea: CGRect? {
+        let all = (strokes.map { $0.bounds } + typeset.map { $0.bounds }).reduce(CGRect.null) { $0.union($1) }
+        return all.isNull ? nil : all.insetBy(dx: -24, dy: -24).integral
+    }
+
+    /// Draws the ink and the blocks, black on white, into a context whose origin is the
+    /// bottom-left of `area` (the usual PDF and bitmap orientation).
+    private func drawForExport(_ area: CGRect, in ctx: CGContext) {
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(origin: .zero, size: area.size))
+        // Board coordinates grow downward.
+        ctx.translateBy(x: 0, y: area.height)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.translateBy(x: -area.minX, y: -area.minY)
+
+        ctx.setStrokeColor(CGColor(gray: 0, alpha: 1))
+        ctx.setLineWidth(strokeWidth)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        for stroke in strokes { ctx.addPath(stroke.path) }
+        ctx.strokePath()
+
+        let previous = NSGraphicsContext.current
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        for block in typeset {
+            // Re-rendered in black whatever the app's appearance; drawn as vectors, not pixels.
+            let image = MathRenderer.image(latex: block.latex, fontSize: block.fontSize, color: .black) ?? block.image
+            image.draw(in: block.bounds, from: .zero, operation: .sourceOver, fraction: 1,
+                       respectFlipped: true, hints: nil)
+        }
+        NSGraphicsContext.current = previous
+    }
+
+    /// A one-page PDF sized to the content, with strokes and formulas as vectors.
+    func exportPDF() -> Data? {
+        guard let area = exportArea else { return nil }
+        let data = NSMutableData()
+        var box = CGRect(origin: .zero, size: area.size)
+        guard let consumer = CGDataConsumer(data: data),
+              let ctx = CGContext(consumer: consumer, mediaBox: &box, nil) else { return nil }
+        ctx.beginPDFPage(nil)
+        drawForExport(area, in: ctx)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        return data as Data
+    }
+
+    /// The same picture as pixels, at twice the board's size unless that would be huge.
+    func exportPNG() -> Data? {
+        guard let area = exportArea else { return nil }
+        let scale = min(2, 12000 / max(area.width, area.height))
+        let width = Int((area.width * scale).rounded(.up)), height = Int((area.height * scale).rounded(.up))
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.scaleBy(x: scale, y: scale)
+        drawForExport(area, in: ctx)
+        guard let image = ctx.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    }
+
+    /// A LaTeX document of the board; `figurePrefix` names the pictures made from leftover ink.
+    func exportLaTeX(figurePrefix: String) -> LatexExport.Output? {
+        guard exportArea != nil else { return nil }
+        return LatexExport.document(blocks: typeset.map { ($0.source, $0.bounds) }, strokes: strokes,
+                                    strokeWidth: strokeWidth, figurePrefix: figurePrefix)
+    }
+
+    /// Closes the typing field, keeping what it holds when that can be typeset.
+    func endEditing() {
+        if !commitEdit() { cancelEdit() }
+    }
     private enum UndoItem {
         case stroke
         case clear([Stroke], [Typeset])
@@ -879,7 +1071,10 @@ final class BoardView: NSView, NSTextFieldDelegate {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         let color = inkColor
+        // A new colour is not a change to the board's content.
+        trackChanges = false
         for i in typeset.indices { typeset[i].recolor(color) }
+        trackChanges = true
         needsDisplay = true
     }
 

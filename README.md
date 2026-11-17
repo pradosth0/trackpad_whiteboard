@@ -79,6 +79,22 @@ line continues (**Board > Auto-continue Lines** turns this off).
 
 Example of typed input: `the roots of $x^2+3x+3=0$ are complex`.
 
+### Saving
+
+| Action | What it does |
+|---|---|
+| ⌘S / ⇧⌘S | Save / Save As, to a `.tboard` file |
+| ⌘O | Open a saved board (double-clicking a `.tboard` file works too) |
+| ⌘N | New empty board |
+| ⌘E / ⇧⌘E | Export as PDF / PNG: one page sized to the content, black on white |
+| ⌥⌘E | Export as LaTeX: blocks in reading order, drawings as PDF pictures next to the `.tex` file |
+
+A saved board reopens exactly as it was: ink stays as strokes, typed and recognized blocks stay
+editable, and everything keeps its position. The undo history is not saved.
+
+The board is also kept automatically between launches: quit at any time and it comes back as you
+left it, saved or not. New and Open still ask before replacing a board with unsaved changes.
+
 ### Recognition options
 
 In the **Board** menu:
@@ -89,7 +105,6 @@ In the **Board** menu:
 
 ## Known limits
 
-- Boards are not saved: closing the app loses the board.
 - Recognition occasionally misreads a symbol; open the block and fix it.
 - In typed plain text, accented letters render in an italic style, and `&`, `^`, `~` are dropped.
   Inside `$...$` only the LaTeX commands supported by [SwiftMath](https://github.com/mgriebling/SwiftMath) work.
@@ -108,6 +123,8 @@ The app is a Swift package with no Xcode project. Sources are in `Sources/Trackp
 |---|---|
 | `BoardView.swift` | The board: touches, zone, ink, lines, typing and editing |
 | `Typeset.swift` | Typeset blocks and the `$...$` ⇄ LaTeX conversion |
+| `BoardFile.swift` | The `.tboard` file format (versioned JSON) |
+| `LatexExport.swift` | The LaTeX export: reading order and grouping of ink into pictures |
 | `Recognizer.swift` | Recognition through the Anthropic API |
 | `ClaudeCodeSession.swift` | Recognition through a long-lived `claude` process |
 | `Setup.swift` | The recognition setup dialog |
@@ -122,4 +139,4 @@ Checks that need no trackpad, run on the built binary
 | `--render-test <latex> <out.png>` | Typeset LaTeX to a picture |
 | `--source-test <text>` | Show the LaTeX produced for typed input and whether it renders |
 | `--ocr-test <line.png>... [--claude-code] [--accurate]` | Send pictures through recognition and print the result and delay |
-| `--type-test <prefix>` | Type sample lines with synthetic keystrokes and save pictures of the board |
+| `--type-test <prefix>` | Type sample lines with synthetic keystrokes, save pictures of the board, and check that saving and reopening gives the same board |
