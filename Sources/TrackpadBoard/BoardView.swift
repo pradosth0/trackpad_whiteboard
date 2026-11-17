@@ -767,6 +767,14 @@ final class BoardView: NSView, NSTextFieldDelegate {
         if useClaudeCode { warmUpRecognition() } else { ClaudeCodeSession.shared.stop() }
     }
 
+    /// Applies the choice made in the setup dialog.
+    func setRecognition(enabled: Bool, viaClaudeCode: Bool) {
+        recognizeOnEnter = enabled
+        useClaudeCode = viaClaudeCode
+        warnedAboutSetup = false
+        if enabled, viaClaudeCode { warmUpRecognition() } else { ClaudeCodeSession.shared.stop() }
+    }
+
     /// Starts the Claude Code process early so the first line is not slower than the rest.
     func warmUpRecognition() {
         if recognizeOnEnter, useClaudeCode { ClaudeCodeSession.shared.warmUp(model: model) }
@@ -1036,5 +1044,19 @@ final class BoardView: NSView, NSTextFieldDelegate {
                                     y: bounds.height - size.height - statusSize.height - 14),
                         withAttributes: attrs)
         }
+    }
+}
+
+/// Keeps the menu checkmarks in step with the settings, whoever changed them.
+extension BoardView: NSMenuItemValidation {
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(toggleAutoContinue(_:)): item.state = autoContinue ? .on : .off
+        case #selector(toggleRecognize(_:)): item.state = recognizeOnEnter ? .on : .off
+        case #selector(toggleAccurateModel(_:)): item.state = useAccurateModel ? .on : .off
+        case #selector(toggleClaudeCode(_:)): item.state = useClaudeCode ? .on : .off
+        default: break
+        }
+        return true
     }
 }

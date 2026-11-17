@@ -23,6 +23,13 @@ enum Recognizer {
         return key.isEmpty ? nil : key
     }
 
+    static func saveKey(_ key: String) throws {
+        try FileManager.default.createDirectory(at: keyFile.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try key.write(to: keyFile, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
+    }
+
     static let prompt = """
     This image is one line of handwriting from a whiteboard, written with a finger on a trackpad. \
     It is a math formula, plain words, or a mix of both.

@@ -21,11 +21,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         NSApp.mainMenu = makeMenu()
         window.makeKeyAndOrderFront(nil)
-        board.warmUpRecognition()
+        if RecognitionSetup.isDone {
+            board.warmUpRecognition()
+        } else if !CommandLine.arguments.contains("--type-test") {
+            // After the window is up, so the dialog appears over it.
+            DispatchQueue.main.async { RecognitionSetup.run(for: self.board) }
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--type-test"), CommandLine.arguments.count > i + 1 {
             runTypeTest(prefix: CommandLine.arguments[i + 1])
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showRecognitionSetup(_ sender: Any?) {
+        RecognitionSetup.run(for: board)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -118,6 +127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         boardMenu.items.last?.state = board.useAccurateModel ? .on : .off
         add("Use Claude Code Subscription", #selector(BoardView.toggleClaudeCode(_:)), "k", [.command, .shift])
         boardMenu.items.last?.state = board.useClaudeCode ? .on : .off
+        let setup = boardMenu.addItem(withTitle: "Recognition Setup…",
+                                      action: #selector(showRecognitionSetup(_:)), keyEquivalent: "")
+        setup.target = self
         boardItem.submenu = boardMenu
         main.addItem(boardItem)
 
