@@ -22,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = makeMenu()
         window.makeKeyAndOrderFront(nil)
         board.warmUpRecognition()
+        if let i = CommandLine.arguments.firstIndex(of: "--type-test"), CommandLine.arguments.count > i + 1 {
+            runTypeTest(prefix: CommandLine.arguments[i + 1])
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -39,6 +42,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         board.setCapture(false)
     }
 
+    /// Developer check: feeds synthetic keystrokes through the window, as if typed, and saves
+    /// pictures of the board mid-typing (`<prefix>-typing.png`) and after (`<prefix>-done.png`).
+    private func runTypeTest(prefix: String) {
+        func press(_ characters: String, keyCode: UInt16 = 0) {
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                               timestamp: ProcessInfo.processInfo.systemUptime,
+                                               windowNumber: window.windowNumber, context: nil,
+                                               characters: characters, charactersIgnoringModifiers: characters,
+                                               isARepeat: false, keyCode: keyCode) else { return }
+            window.sendEvent(event)
+        }
+        func type(_ text: String) { text.forEach { press(String($0)) } }
+        func snapshot(_ name: String) {
+            guard let rep = board.bitmapImageRepForCachingDisplay(in: board.bounds) else { return }
+            board.cacheDisplay(in: board.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: "\(prefix)-\(name).png"))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            type("the roots of $x^2+3x+3=0$ are complex")
+            press("\r", keyCode: 36)
+            type("$\\int_0^3 f(x) = \\frac{a}{b")
+            snapshot("typing")
+            type("}$")
+            press("\r", keyCode: 36)
+            type("cancelled")
+            press("\u{1B}", keyCode: 53)
+            snapshot("done")
+            NSApp.terminate(nil)
+        }
+    }
+
     private func makeMenu() -> NSMenu {
         let main = NSMenu()
 
@@ -48,6 +83,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         main.addItem(appItem)
+
+        // Standard editing commands for the typing field.
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        main.addItem(editItem)
 
         let boardItem = NSMenuItem()
         let boardMenu = NSMenu(title: "Board")
@@ -85,6 +130,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 //   --ocr-test <line.png>...          send pictures through recognition and print the LaTeX
 //                                     (add --claude-code for the subscription route, --accurate for Opus)
 let arguments = CommandLine.arguments
+if let i = arguments.firstIndex(of: "--source-test"), arguments.count > i + 1 {
+    // Typed form -> LaTeX -> typed form, and whether it renders.
+    if arguments.contains("--from-latex") {
+        print(Markup.source(fromLatex: arguments[i + 1]))
+        exit(0)
+    }
+    let latex = Markup.latex(fromSource: arguments[i + 1])
+    let ok = MathRenderer.image(latex: latex, fontSize: 24, color: .black) != nil
+    print("\(latex)  |  back: \(Markup.source(fromLatex: latex))  |  \(ok ? "renders" : "RENDER FAILED")")
+    exit(0)
+}
 if let i = arguments.firstIndex(of: "--render-test"), arguments.count > i + 2 {
     guard let item = Typeset(latex: arguments[i + 1], replacing: CGRect(x: 0, y: 0, width: 400, height: 60),
                              color: .black),

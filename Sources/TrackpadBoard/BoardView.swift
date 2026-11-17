@@ -47,7 +47,7 @@ struct Stroke {
     }
 }
 
-final class BoardView: NSView {
+final class BoardView: NSView, NSTextFieldDelegate {
     // MARK: Tunables
 
     /// How far Enter moves the zone down when the line has no ink, as a fraction of the zone height.
@@ -71,10 +71,44 @@ final class BoardView: NSView {
     private enum UndoItem {
         case stroke
         case clear([Stroke], [Typeset])
+        /// A block was typed, edited or deleted; undo puts back what it was (nil: it did not exist).
+        case block(id: Int, previous: Typeset?)
         /// A line was replaced by typeset math; undo puts the handwriting back.
         case recognized(ink: [(index: Int, stroke: Stroke)], typesetID: Int)
     }
     private var undoStack: [UndoItem] = []
+
+    // MARK: Typing and editing state
+
+    /// The block being typed or edited in the field at the bottom of the window.
+    private struct Edit {
+        let id: Int
+        /// The block before editing; nil when it is being typed from scratch.
+        let original: Typeset?
+        let fontSize: CGFloat
+        var placement: Typeset.Placement
+        /// False while the field holds something that cannot be typeset.
+        var valid = true
+    }
+    private var edit: Edit?
+    private let typedFontSize: CGFloat = 24
+    /// Blocks typed on the line being written; they count as its content, like ink.
+    private var lineBlockIDs: [Int] = []
+    /// When and where the current hover touch began, to tell a tap from a look-around.
+    private var hoverStart: (time: Date, norm: CGPoint)?
+    private var hoverTravel: CGFloat = 0
+    private lazy var field: NSTextField = {
+        let field = NSTextField(frame: .zero)
+        field.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+        field.bezelStyle = .roundedBezel
+        field.placeholderString = "Text, with math between $…$"
+        field.cell?.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.delegate = self
+        field.isHidden = true
+        addSubview(field)
+        return field
+    }()
 
     // MARK: Recognition state
 
@@ -151,6 +185,7 @@ final class BoardView: NSView {
 
     override func layout() {
         super.layout()
+        if edit != nil { layoutField() }
         followPad()
     }
 
@@ -180,7 +215,33 @@ final class BoardView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if !captured { setCapture(true) }
+        if !captured {
+            setCapture(true)
+        } else {
+            clickAtPointer()
+        }
+    }
+
+    /// Control + click arrives as a right click on some setups.
+    override func rightMouseDown(with event: NSEvent) {
+        if captured { clickAtPointer() }
+    }
+
+    /// Pressing the trackpad with the hover pointer (Shift) or the target crosshair (Control)
+    /// on a block opens that block for editing.
+    private func clickAtPointer() {
+        guard let point = hoverPoint ?? anchor, let block = block(at: point) else { return }
+        if hoverPoint == nil {
+            // The crosshair was only used to pick the block.
+            anchor = nil
+            anchorIsPreview = false
+        }
+        // The finger is still down: it must not ink, move the target or count as a tap.
+        current = nil
+        mode = .ignore
+        hoverPoint = nil
+        hoverStart = nil
+        beginEdit(of: block)
     }
 
     // MARK: Touches
@@ -237,6 +298,8 @@ final class BoardView: NSView {
             } else if hoverKeyDown {
                 mode = .hover
                 hoverPoint = worldPoint(norm)
+                hoverStart = (Date(), norm)
+                hoverTravel = 0
             } else {
                 mode = .draw
                 repositionForTouch(at: norm)
@@ -307,14 +370,18 @@ final class BoardView: NSView {
     /// Height to move down for a new line: the height of the ink on the current line plus a gap.
     private func newLineStep() -> CGFloat {
         let r = padRect
-        let ink = strokes[min(lineStart, strokes.count)...]
-            .filter { $0.bounds.maxY > r.minY && $0.bounds.minY < r.maxY }
-        guard let top = ink.map({ $0.bounds.minY }).min(),
-              let bottom = ink.map({ $0.bounds.maxY }).max() else {
-            return r.height * lineStepFraction
-        }
-        let used = bottom - top
+        guard let used = currentLineBounds()?.height else { return r.height * lineStepFraction }
         return max(used + max(14, used * 0.2), r.height * 0.15)
+    }
+
+    /// The area used by the line being written: its ink in the zone's band, and blocks typed on it.
+    private func currentLineBounds() -> CGRect? {
+        let r = padRect
+        let ink = strokes[min(lineStart, strokes.count)...]
+            .filter { $0.bounds.maxY > r.minY && $0.bounds.minY < r.maxY }.map { $0.bounds }
+        let blocks = typeset.filter { lineBlockIDs.contains($0.id) }.map { $0.bounds }
+        let all = (ink + blocks).reduce(CGRect.null) { $0.union($1) }
+        return all.isNull ? nil : all
     }
 
     private func touchMoved(_ touch: NSTouch, commandDown: Bool, controlDown: Bool) {
@@ -323,6 +390,9 @@ final class BoardView: NSView {
         case .hover:
             if hoverKeyDown {
                 hoverPoint = worldPoint(norm)
+                if let start = hoverStart {
+                    hoverTravel = max(hoverTravel, hypot(norm.x - start.norm.x, norm.y - start.norm.y))
+                }
             } else {
                 // Releasing Shift with the finger still down starts inking from the pointer.
                 hoverPoint = nil
@@ -367,9 +437,22 @@ final class BoardView: NSView {
         case .pan:
             if commandDown {
                 let size = padRect.size
-                padOrigin.x += (norm.x - lastNorm.x) * size.width
-                padOrigin.y -= (norm.y - lastNorm.y) * size.height
-                followPad()
+                let dx = (norm.x - lastNorm.x) * size.width
+                let dy = -(norm.y - lastNorm.y) * size.height
+                if var editing = edit {
+                    // A block is open: Command + finger moves that block instead of the zone.
+                    editing.placement = editing.placement.moved(dx: dx, dy: dy)
+                    edit = editing
+                    if let index = typeset.firstIndex(where: { $0.id == editing.id }) {
+                        typeset[index].move(dx: dx, dy: dy)
+                        followPoint(CGPoint(x: typeset[index].bounds.minX, y: typeset[index].bounds.midY))
+                    }
+                    needsDisplay = true
+                } else {
+                    padOrigin.x += dx
+                    padOrigin.y += dy
+                    followPad()
+                }
             } else {
                 // Releasing Command mid-move must not start inking; wait for a fresh touch.
                 mode = .ignore
@@ -382,6 +465,12 @@ final class BoardView: NSView {
 
     private func finishTouch() {
         commitCurrent()
+        // A short Shift + tap on a block opens it for editing.
+        if mode == .hover, captured, let point = hoverPoint, let start = hoverStart,
+           Date().timeIntervalSince(start.time) < 0.4, hoverTravel < 0.04, let block = block(at: point) {
+            beginEdit(of: block)
+        }
+        hoverStart = nil
         mode = .idle
         trackedID = nil
         if hoverPoint != nil {
@@ -432,6 +521,11 @@ final class BoardView: NSView {
         switch event.keyCode {
         case 36, 76: // Return, keypad Enter
             if event.modifierFlags.contains(.shift) {
+                // With the hover pointer on a block, Shift+Enter opens it instead.
+                if let point = hoverPoint, let block = block(at: point) {
+                    beginEdit(of: block)
+                    return
+                }
                 if let previous = lineHistory.popLast() {
                     padOrigin = previous.origin
                     lineStart = min(previous.lineStart, strokes.count)
@@ -439,25 +533,179 @@ final class BoardView: NSView {
                     padOrigin.y -= padRect.height * lineStepFraction
                     padOrigin.x = marginX
                 }
+                lineBlockIDs = []
+                anchor = nil
+                followPad()
             } else {
-                lineHistory.append((padOrigin, lineStart))
-                recognizeCurrentLine()
-                padOrigin.y += newLineStep()
-                padOrigin.x = marginX
-                lineStart = strokes.count
+                newLine()
             }
-            anchor = nil
-            followPad()
         case 53: // Escape
             setCapture(!captured)
+        case 51, 117: // Delete, forward delete: removes the block under the pointer or crosshair.
+            if let point = hoverPoint ?? anchor, let block = block(at: point) {
+                typeset.removeAll { $0.id == block.id }
+                lineBlockIDs.removeAll { $0 == block.id }
+                undoStack.append(.block(id: block.id, previous: block))
+                needsDisplay = true
+            }
         default:
-            super.keyDown(with: event)
+            if startsTyping(event) {
+                beginTyping(with: event)
+            } else {
+                super.keyDown(with: event)
+            }
         }
     }
 
+    private func newLine() {
+        lineHistory.append((padOrigin, lineStart))
+        recognizeCurrentLine()
+        padOrigin.y += newLineStep()
+        padOrigin.x = marginX
+        lineStart = strokes.count
+        lineBlockIDs = []
+        anchor = nil
+        followPad()
+    }
+
+    // MARK: Typing and editing blocks
+
+    private func block(at point: CGPoint) -> Typeset? {
+        typeset.last { $0.bounds.insetBy(dx: -6, dy: -6).contains(point) }
+    }
+
+    /// Any key that produces text opens a new block; shortcuts and navigation keys do not.
+    private func startsTyping(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags
+        if flags.contains(.command) || flags.contains(.control) || flags.contains(.function) { return false }
+        // Delete, forward delete, Tab, Space.
+        return ![51, 117, 48, 49].contains(event.keyCode)
+    }
+
+    /// Typed text goes on the precision target if set, else after what is already on the
+    /// line, else at the top-left of the zone.
+    private func placementForTyping() -> Typeset.Placement {
+        if let a = anchor { return .leftCentre(a) }
+        if let line = currentLineBounds() {
+            return .leftCentre(CGPoint(x: line.maxX + typedFontSize * 0.5, y: line.midY))
+        }
+        let r = padRect
+        return .topLeft(CGPoint(x: r.minX + 0.03 * r.width, y: r.minY + 0.06 * r.height))
+    }
+
+    private func beginTyping(with event: NSEvent) {
+        edit = Edit(id: Typeset.newID(), original: nil, fontSize: typedFontSize, placement: placementForTyping())
+        anchor = nil
+        anchorIsPreview = false
+        openField(with: "")
+        // Hand the keystroke that started it to the field, so dead keys and accents work.
+        field.currentEditor()?.keyDown(with: event)
+    }
+
+    private func beginEdit(of block: Typeset) {
+        if edit?.id == block.id { return }
+        if !commitEdit() { cancelEdit() }
+        edit = Edit(id: block.id, original: block, fontSize: block.fontSize, placement: block.placement)
+        openField(with: block.source)
+    }
+
+    private func openField(with text: String) {
+        field.stringValue = text
+        field.textColor = .labelColor
+        field.isHidden = false
+        layoutField()
+        window?.makeFirstResponder(field)
+        field.currentEditor()?.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+        needsDisplay = true
+    }
+
+    /// The field sits at the bottom, away from the parked cursor, so touches keep reaching the board.
+    private func layoutField() {
+        let width = min(760, max(200, bounds.width - 80))
+        field.frame = CGRect(x: (bounds.width - width) / 2, y: bounds.height - 86, width: width, height: 26)
+    }
+
+    /// Live preview: the block on the board follows the field while it can be typeset.
+    func controlTextDidChange(_ obj: Notification) {
+        guard var editing = edit else { return }
+        let source = field.stringValue
+        if source.trimmingCharacters(in: .whitespaces).isEmpty {
+            typeset.removeAll { $0.id == editing.id }
+            editing.valid = true
+        } else if let block = Typeset(source: source, fontSize: editing.fontSize, placement: editing.placement,
+                                      color: inkColor, id: editing.id) {
+            if let index = typeset.firstIndex(where: { $0.id == editing.id }) {
+                typeset[index] = block
+            } else {
+                typeset.append(block)
+            }
+            editing.valid = true
+        } else {
+            // Keep showing the last version that rendered.
+            editing.valid = false
+        }
+        field.textColor = editing.valid ? .labelColor : .systemRed
+        edit = editing
+        needsDisplay = true
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)):
+            let typedNewBlock = edit?.original == nil && typeset.contains { $0.id == edit?.id }
+            if commitEdit(), typedNewBlock { newLine() }
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            cancelEdit()
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Keeps what the field shows. Returns false, leaving the field open, if it cannot be typeset.
+    @discardableResult
+    private func commitEdit() -> Bool {
+        guard let editing = edit else { return true }
+        guard editing.valid else {
+            NSSound.beep()
+            return false
+        }
+        let result = typeset.first { $0.id == editing.id }
+        if result?.source != editing.original?.source || result?.origin != editing.original?.origin {
+            undoStack.append(.block(id: editing.id, previous: editing.original))
+            if editing.original == nil { lineBlockIDs.append(editing.id) }
+        }
+        closeField()
+        return true
+    }
+
+    private func cancelEdit() {
+        guard let editing = edit else { return }
+        typeset.removeAll { $0.id == editing.id }
+        if let original = editing.original { typeset.append(original) }
+        closeField()
+    }
+
+    private func closeField() {
+        edit = nil
+        window?.makeFirstResponder(self)
+        field.isHidden = true
+        needsDisplay = true
+    }
+
     @objc func undoStroke(_ sender: Any?) {
+        if edit != nil {
+            // While typing, undo belongs to the text field.
+            field.currentEditor()?.undoManager?.undo()
+            return
+        }
         guard let item = undoStack.popLast() else { return }
         switch item {
+        case .block(let id, let previous):
+            typeset.removeAll { $0.id == id }
+            lineBlockIDs.removeAll { $0 == id }
+            if let previous { typeset.append(previous) }
         case .stroke:
             if let last = strokes.popLast() { pendingStrokes.remove(last.id) }
         case .clear(let oldStrokes, let oldTypeset):
@@ -481,12 +729,23 @@ final class BoardView: NSView {
     }
 
     @objc func clearBoard(_ sender: Any?) {
+        if let editing = edit {
+            // With a block open, the shortcut deletes that block rather than the whole board.
+            typeset.removeAll { $0.id == editing.id }
+            if let original = editing.original {
+                lineBlockIDs.removeAll { $0 == editing.id }
+                undoStack.append(.block(id: editing.id, previous: original))
+            }
+            closeField()
+            return
+        }
         guard !strokes.isEmpty || !typeset.isEmpty else { return }
         undoStack.append(.clear(strokes, typeset))
         strokes = []
         typeset = []
         pendingStrokes = []
         lineStart = 0
+        lineBlockIDs = []
         needsDisplay = true
     }
 
@@ -685,10 +944,37 @@ final class BoardView: NSView {
             ctx.strokePath()
         }
 
-        // Recognized lines.
+        // Typeset blocks.
         for item in typeset where item.bounds.intersects(visible) {
             item.image.draw(in: item.bounds, from: .zero, operation: .sourceOver, fraction: 1,
                             respectFlipped: true, hints: nil)
+        }
+
+        // The block under the hover pointer, and the one being edited.
+        if edit == nil, let point = hoverPoint ?? anchor, let hovered = block(at: point) {
+            ctx.addPath(CGPath(roundedRect: hovered.bounds.insetBy(dx: -6, dy: -6),
+                               cornerWidth: 5, cornerHeight: 5, transform: nil))
+            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.5).cgColor)
+            ctx.setLineWidth(1)
+            ctx.strokePath()
+        }
+        if let editing = edit {
+            ctx.setStrokeColor(NSColor.controlAccentColor.cgColor)
+            ctx.setLineWidth(1.5)
+            if let block = typeset.first(where: { $0.id == editing.id }) {
+                ctx.addPath(CGPath(roundedRect: block.bounds.insetBy(dx: -6, dy: -6),
+                                   cornerWidth: 5, cornerHeight: 5, transform: nil))
+            } else {
+                // Nothing typed yet: a caret where the block will appear.
+                let top: CGPoint
+                switch editing.placement {
+                case .topLeft(let p): top = p
+                case .leftCentre(let p): top = CGPoint(x: p.x, y: p.y - editing.fontSize / 2)
+                }
+                ctx.move(to: top)
+                ctx.addLine(to: CGPoint(x: top.x, y: top.y + editing.fontSize))
+            }
+            ctx.strokePath()
         }
 
         // Trackpad zone outline.
@@ -730,8 +1016,10 @@ final class BoardView: NSView {
     }
 
     private func drawHint() {
-        let text = captured
-            ? "Trackpad captured  ·  ⌘ + finger: move zone  ·  ⌃ + finger: move next-stroke target  ·  ⇧ + finger: hover  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
+        let text = edit != nil
+            ? "Typing  ·  math goes between $…$  ·  ↩ keep  ·  esc cancel  ·  ⌘ + finger: move this block  ·  ⌘⌫ delete it"
+            : captured
+            ? "⌘ + finger: move zone  ·  ⌃ + finger: move target  ·  ⇧ + finger: hover  ·  ⇧ or ⌃ + click on a block: edit, ⌫: delete  ·  type: add text  ·  ↩ new line  ·  ⇧↩ previous line  ·  ⌘Z undo  ·  esc: release cursor"
             : "Click or press esc to capture the trackpad"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
